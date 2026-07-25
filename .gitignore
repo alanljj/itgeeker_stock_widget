@@ -1,3 +1,8 @@
+# ai
+.codegraph/
+.omo/
+.workbuddy/
+
 #js
 node_modules
 
@@ -9,8 +14,10 @@ Desktop.ini
 # My configurations:
 __pycache__/
 *.py[cod]
-/.venv
-/.pytest_cache
+.venv/
+.pyenv/
+.pytest_cache/
+*.spec
 
 # C extensions
 *.so

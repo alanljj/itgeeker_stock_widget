@@ -1,3 +1,4 @@
+import re
 import requests
 import concurrent.futures
 import datetime
@@ -308,7 +309,7 @@ def fetch_daily_kline(code):
             qfqday = data['data'][api_code].get('qfqday', [])
             if not qfqday:
                 qfqday = data['data'][api_code].get('day', [])
-            
+
             klines = []
             for k in qfqday:
                 klines.append({
@@ -322,4 +323,76 @@ def fetch_daily_kline(code):
     except Exception as e:
         print(f"Failed to fetch kline data for {code}:", e)
     return []
+
+
+def search_stocks(keyword, limit=20):
+    """
+    按关键词（股票名称或代码）搜索股票。
+
+    使用腾讯财经 smartbox 接口：
+        GET https://smartbox.gtimg.cn/s3/?v=2&q={keyword}&t=all&c={limit}
+
+    返回格式示例（v_hint 字段）：
+        sz~000651~\\u683c\\u529b\\u7535\\u5668~gldq~GP-A^...
+    每段结构: market~code~name(unicode escape)~pinyin~type
+
+    返回:
+        [{"code": "000651.sz", "name": "格力电器", "market": "sz"}, ...]
+        code 使用项目标准格式 (xxx.sh / xxx.sz / xxx.hk / xxx.us)。
+    """
+    if not keyword:
+        return []
+    keyword = keyword.strip()
+    if not keyword:
+        return []
+
+    url = "https://smartbox.gtimg.cn/s3/"
+    params = {"v": "2", "q": keyword, "t": "all", "c": str(limit)}
+
+    try:
+        response = requests.get(url, params=params, timeout=5)
+        text = response.text
+    except Exception as e:
+        print(f"Failed to search stocks for '{keyword}': {e}")
+        return []
+
+    m = re.search(r'v_hint="([^"]*)"', text)
+    if not m:
+        return []
+    hint_str = m.group(1)
+    if not hint_str:
+        return []
+
+    results = []
+    for entry in hint_str.split('^'):
+        if not entry:
+            continue
+        parts = entry.split('~')
+        if len(parts) < 3:
+            continue
+        market = parts[0].lower()              # sh / sz / hk / us
+        raw_code = parts[1]                    # 000651 / aapl.oq 等
+        name_raw = parts[2]                    # \\u683c\\u529b... 字面转义
+
+        # 解码 unicode 转义: \\uXXXX -> 字符
+        try:
+            name = name_raw.encode("ascii").decode("unicode_escape")
+        except Exception:
+            name = name_raw
+
+        # 标准化到项目格式 (600900.sh)
+        code = format_stock_code(f"{market}{raw_code}")
+
+        if not code or not name:
+            continue
+
+        results.append({
+            "code": code,
+            "name": name,
+            "market": market,
+        })
+        if len(results) >= limit:
+            break
+
+    return results
 

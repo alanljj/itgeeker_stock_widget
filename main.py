@@ -15,7 +15,7 @@ from stock_widget_window import StockWidget
 _CONFIG_DIR = os.path.join(os.path.expanduser("~"), "itgeeker_widget_config")
 CONFIG_FILE = os.path.join(_CONFIG_DIR, "config_stock.json")
 _OLD_CONFIG_FILE = "categories.json"  # 旧版配置路径，迁移时使用
-APP_VERSION = "v1.3.10.0"
+APP_VERSION = "v1.3.12.0"
 APP_NAME = "ITGeeker Stock Widget"
 
 DEFAULT_CONFIG = {
@@ -176,10 +176,14 @@ class EditCategoryDialog(QDialog):
     def __init__(self, category_data, parent=None):
         super().__init__(parent)
         self.setWindowTitle("编辑分组与股票")
-        self.resize(650, 450)
+        self.resize(750, 450)
         self.category_data = category_data
         self.codes = list(category_data.get('codes', []))
         self.alerts = dict(category_data.get('alerts', {}))
+
+        # 股票名称缓存：仅当 codes 集合（增/删）变化时才重新请求网络
+        self._basics_cache = None
+        self._basics_cache_codes = None
         
         layout = QVBoxLayout()
         
@@ -207,7 +211,7 @@ class EditCategoryDialog(QDialog):
         # Add stock line
         add_layout = QHBoxLayout()
         self.new_code_input = QLineEdit()
-        self.new_code_input.setPlaceholderText("输入股票代码 (如 000651)")
+        self.new_code_input.setPlaceholderText("输入股票代码 (如 000651) 或名称 (如 格力)")
         self.new_code_input.returnPressed.connect(self.add_stock)
         add_btn = QPushButton("添加股票")
         add_btn.clicked.connect(self.add_stock)
@@ -238,74 +242,243 @@ class EditCategoryDialog(QDialog):
         self.setLayout(layout)
 
     def on_accept(self):
-        # Save threshold settings before closing
-        self.alerts = {}
-        for row in range(self.table.rowCount()):
-            if row < len(self.codes):
-                code = self.codes[row]
-                high_spin = self.table.cellWidget(row, 3)
-                low_spin = self.table.cellWidget(row, 4)
-                if high_spin and low_spin:
-                    h_val = high_spin.value()
-                    l_val = low_spin.value()
-                    if h_val != 0.0 or l_val != 0.0:
-                        self.alerts[code] = {'high': h_val, 'low': l_val}
+        # 从 UI 中读取所有提醒值后关闭对话框
+        self._capture_alerts()
         self.accept()
 
     def populate_table(self):
         self.table.setRowCount(0)
         if not self.codes:
             return
-        
+
         from data_service import fetch_stock_basics, format_stock_code
-        basics = fetch_stock_basics(self.codes)
-        valid_map = {b['code']: b['name'] for b in basics}
-        
+
+        # 仅当代码集合发生变化（增删股票）时才重新请求名称缓存；
+        # 单纯调整顺序时复用缓存，避免不必要的网络请求。
+        if self._basics_cache is None or set(self._basics_cache_codes or []) != set(self.codes):
+            basics = fetch_stock_basics(self.codes)
+            self._basics_cache = {b['code']: b['name'] for b in basics}
+            self._basics_cache_codes = list(self.codes)
+        valid_map = self._basics_cache
+
         for idx, code in enumerate(self.codes):
             row = self.table.rowCount()
             self.table.insertRow(row)
-            
+
             f_code = format_stock_code(code)  # 现在返回 600900.sh 格式
             name = valid_map.get(f_code, "未找到")
             # 从新格式获取前缀：600900.sh -> .sh -> SH
             prefix = f_code.split('.')[-1].upper() if '.' in f_code else ""
-            
+
             # fill row
             self.table.setItem(row, 0, QTableWidgetItem(f_code))
             self.table.setItem(row, 1, QTableWidgetItem(name))
-            
+
             prefix_item = QTableWidgetItem(prefix)
             self.table.setItem(row, 2, prefix_item)
-            
+
             # Spinboxes
             high_spin = QDoubleSpinBox()
             high_spin.setRange(0, 500)
             high_spin.setValue(self.alerts.get(code, {}).get('high', 0.0))
             self.table.setCellWidget(row, 3, high_spin)
-            
+
             low_spin = QDoubleSpinBox()
             low_spin.setRange(-100, 0)
             low_spin.setValue(self.alerts.get(code, {}).get('low', 0.0))
             self.table.setCellWidget(row, 4, low_spin)
-            
+
+            # 操作列：上移 / 下移 / 删除
+            op_widget = QWidget()
+            op_layout = QHBoxLayout(op_widget)
+            op_layout.setContentsMargins(2, 0, 2, 0)
+            op_layout.setSpacing(4)
+
+            up_btn = QPushButton("↑")
+            up_btn.setMaximumWidth(30)
+            up_btn.setToolTip("上移")
+            up_btn.setEnabled(idx > 0)  # 首行禁用
+            up_btn.clicked.connect(lambda checked, c=code: self.move_stock(c, -1))
+
+            down_btn = QPushButton("↓")
+            down_btn.setMaximumWidth(30)
+            down_btn.setToolTip("下移")
+            down_btn.setEnabled(idx < len(self.codes) - 1)  # 末行禁用
+            down_btn.clicked.connect(lambda checked, c=code: self.move_stock(c, +1))
+
             del_btn = QPushButton("删除")
             del_btn.clicked.connect(lambda checked, c=code: self.remove_stock(c))
-            self.table.setCellWidget(row, 5, del_btn)
+
+            op_layout.addWidget(up_btn)
+            op_layout.addWidget(down_btn)
+            op_layout.addWidget(del_btn)
+            op_layout.addStretch()
+
+            self.table.setCellWidget(row, 5, op_widget)
 
     def remove_stock(self, code):
+        # 删除前先保存当前 UI 中的提醒值
+        self._capture_alerts()
         if code in self.codes:
             self.codes.remove(code)
+            # 删除后代码集合变化，需清缓存让 populate_table 重新拉取名称
+            self._basics_cache = None
+            self._basics_cache_codes = None
             self.populate_table()
 
+    def move_stock(self, code, direction):
+        """调整股票顺序。direction: -1=上移, +1=下移"""
+        if code not in self.codes:
+            return
+        idx = self.codes.index(code)
+        new_idx = idx + direction
+        if new_idx < 0 or new_idx >= len(self.codes):
+            return
+        # 移动前先把用户在 spinbox 中输入的提醒值同步到 self.alerts，
+        # 避免重新渲染时被默认值 0.0 覆盖。
+        self._capture_alerts()
+        # 交换顺序
+        self.codes[idx], self.codes[new_idx] = self.codes[new_idx], self.codes[idx]
+        self.populate_table()
+
+    def _capture_alerts(self):
+        """从 UI 中读取所有 spinbox 值，保存到 self.alerts"""
+        captured = {}
+        for row in range(self.table.rowCount()):
+            if row >= len(self.codes):
+                break
+            code = self.codes[row]
+            high_spin = self.table.cellWidget(row, 3)
+            low_spin = self.table.cellWidget(row, 4)
+            if high_spin and low_spin:
+                h_val = high_spin.value()
+                l_val = low_spin.value()
+                if h_val != 0.0 or l_val != 0.0:
+                    captured[code] = {'high': h_val, 'low': l_val}
+        self.alerts = captured
+
     def add_stock(self):
-        code = self.new_code_input.text().strip()
-        if code:
-            if code in self.codes:
-                QMessageBox.warning(self, "提示", f"股票 {code} 已存在于当前分组中！")
-            else:
-                self.codes.append(code)
-                self.new_code_input.clear()
-                self.populate_table()
+        """根据用户输入添加股票：智能识别代码或名称关键词"""
+        from data_service import search_stocks
+        keyword = self.new_code_input.text().strip()
+        if not keyword:
+            return
+
+        # 输入像股票代码 → 直接添加
+        if self._looks_like_code(keyword):
+            self._try_add_stock(keyword)
+            return
+
+        # 像名称/关键词 → 走搜索
+        results = search_stocks(keyword)
+        if not results:
+            QMessageBox.warning(
+                self, "未找到",
+                f"未找到匹配 '{keyword}' 的股票。\n"
+                f"提示：可输入 6 位数字代码 (如 000651) 或股票名称关键词 (如 格力)。"
+            )
+            return
+
+        if len(results) == 1:
+            # 唯一结果，直接添加
+            self._try_add_stock(results[0]['code'])
+            return
+
+        # 多个结果 → 弹窗让用户选择
+        chosen = self._pick_stock(keyword, results)
+        if chosen:
+            self._try_add_stock(chosen)
+
+    def _looks_like_code(self, text):
+        """判断输入是否像股票代码（A 股/港股数字、美股字母数字组合）"""
+        import re
+        t = text.lower().strip().replace(' ', '')
+        if not t:
+            return False
+        # 纯数字 5-6 位（A股 6、港股 5）
+        if re.fullmatch(r'\d{5,6}', t):
+            return True
+        # sh/sz/hk/bj 前缀 + 5-6 位数字
+        if re.fullmatch(r'(sh|sz|hk|bj)\d{5,6}', t):
+            return True
+        # us 前缀 + 字母数字组合，可能带 .oq/.nq 等交易所后缀
+        if re.fullmatch(r'us[a-z0-9]+(\.[a-z]+)?', t):
+            return True
+        # 数字 + .sh/.sz/.hk/.bj/.us 后缀
+        if re.fullmatch(r'\d{5,6}\.(sh|sz|hk|bj|us)', t):
+            return True
+        return False
+
+    def _try_add_stock(self, code):
+        """添加单只股票到当前分组（含缓存清理与去重检查）"""
+        from data_service import format_stock_code
+        code = format_stock_code(code)
+        if not code:
+            QMessageBox.warning(self, "提示", "无效的股票代码！")
+            return
+        if code in self.codes:
+            QMessageBox.warning(self, "提示", f"股票 {code} 已存在于当前分组中！")
+            return
+        self.codes.append(code)
+        self.new_code_input.clear()
+        # 代码集合变化，清缓存让 populate_table 重新拉取名称
+        self._basics_cache = None
+        self._basics_cache_codes = None
+        self.populate_table()
+
+    def _pick_stock(self, keyword, results):
+        """弹出股票选择窗口；返回用户选中的 code，未选返回 None"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"搜索结果：{keyword}")
+        dlg.resize(560, 420)
+
+        layout = QVBoxLayout()
+
+        info_label = QLabel(f"关键词 '{keyword}' 匹配到 {len(results)} 个股票，请选择要添加的：")
+        info_label.setStyleSheet("font-weight: bold; padding: 4px;")
+        layout.addWidget(info_label)
+
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
+        MARKET_LABEL = {"sh": "沪A", "sz": "深A", "hk": "港股", "bj": "京A", "us": "美股"}
+        for stock in results:
+            prefix = stock['code'].split('.')[-1].upper() if '.' in stock['code'] else ''
+            market_text = MARKET_LABEL.get(stock['market'], prefix)
+            item_text = f"{stock['code']:<14}  {stock['name']}  [{market_text}]"
+            list_item = QListWidgetItem(item_text)
+            list_item.setData(Qt.UserRole, stock['code'])
+            list_widget.addItem(list_item)
+        list_widget.setCurrentRow(0)
+        layout.addWidget(list_widget)
+
+        # 双击直接添加
+        list_widget.itemDoubleClicked.connect(lambda _item: dlg.accept())
+
+        btn_layout = QHBoxLayout()
+
+        def on_ok():
+            if not list_widget.currentItem():
+                QMessageBox.warning(dlg, "提示", "请先选择一项！")
+                return
+            dlg.accept()
+
+        ok_btn = QPushButton("添加选中")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(on_ok)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(dlg.reject)
+
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addStretch()
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+        dlg.setLayout(layout)
+        if dlg.exec() == QDialog.Accepted:
+            item = list_widget.currentItem()
+            if item:
+                return item.data(Qt.UserRole)
+        return None
 
     def import_csv(self):
         export_dir = get_export_dir()
