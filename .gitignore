@@ -2,6 +2,11 @@
 .codegraph/
 .omo/
 .workbuddy/
+implementation_plan_*.md
+CLAUDE.md
+openwiki/
+/doc/
+tests/
 
 #js
 node_modules
@@ -18,6 +23,10 @@ __pycache__/
 .pyenv/
 .pytest_cache/
 *.spec
+*使用说明*.md
+*推广介绍*.md
+*更新日志*.md
+*免责声明*.md
 
 # C extensions
 *.so
